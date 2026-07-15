@@ -126,7 +126,7 @@ def _pose_similarity(candidate_points, candidate_conf, template_points, template
 
 
 class DancerSelector:
-    """Select the tracked person whose recent motion best follows the template."""
+    """Independently identify every tracked person following the template."""
 
     def __init__(self, timestamps, keypoints, confidences, valid):
         self.timestamps = np.asarray(timestamps, dtype=np.float32)
@@ -135,19 +135,19 @@ class DancerSelector:
         self.valid = np.asarray(valid, dtype=bool)
         self.valid_indices = np.flatnonzero(self.valid)
         self.tracks = {}
-        self.selected_id = None
-        self._selected_missing_since = None
-        self._challenger_id = None
-        self._challenger_since = None
+        self.selected_ids = set()
+        self._qualifying_since = {}
+        self._below_threshold_since = {}
+        self._missing_since = {}
         self.scores = {}
         self.template_active = False
 
     def reset(self):
         self.tracks.clear()
-        self.selected_id = None
-        self._selected_missing_since = None
-        self._challenger_id = None
-        self._challenger_since = None
+        self.selected_ids.clear()
+        self._qualifying_since.clear()
+        self._below_threshold_since.clear()
+        self._missing_since.clear()
         self.scores = {}
         self.template_active = False
 
@@ -244,7 +244,14 @@ class DancerSelector:
                         current_points[group_common] - previous_points[group_common],
                         axis=1,
                     )
-                    destination.append(float(np.median(displacement) / elapsed))
+                    # A dance can be led by wrists or ankles while shoulders and
+                    # hips stay relatively still. Use the most active half of
+                    # the group instead of a median that would erase that motion.
+                    active_count = max(2, int(np.ceil(len(displacement) * 0.5)))
+                    active_displacement = np.sort(displacement)[-active_count:]
+                    destination.append(
+                        float(np.mean(active_displacement) / elapsed)
+                    )
 
         def scale_speed(values):
             if not values:
@@ -271,7 +278,7 @@ class DancerSelector:
         return 0.55 * age_score + 0.45 * visibility
 
     def update(self, detections, now, template_time):
-        """Update tracks and return (selected_track_id, component_scores)."""
+        """Update tracks and return (selected_track_ids, component_scores)."""
         seen_ids = set()
         for detection in detections:
             track_id = int(detection["track_id"])
@@ -301,12 +308,12 @@ class DancerSelector:
         if not self.template_active:
             # Keep tracking histories warm, but do not select anyone while the
             # template contains an intro, outro, or another pose-free section.
-            self.selected_id = None
-            self._selected_missing_since = None
-            self._challenger_id = None
-            self._challenger_since = None
+            self.selected_ids.clear()
+            self._qualifying_since.clear()
+            self._below_threshold_since.clear()
+            self._missing_since.clear()
             self.scores = {}
-            return None, {}
+            return set(), {}
 
         scores = {}
         for track_id, state in self.tracks.items():
@@ -318,9 +325,9 @@ class DancerSelector:
             visible = float(np.mean(state.history[-1][2] >= 0.3))
             eligible = now - state.first_seen >= 0.4 and visible >= 0.45
             total = (
-                0.55 * template_score
-                + 0.30 * activity_score
-                + 0.15 * reliability_score
+                0.15 * template_score
+                + 0.55 * activity_score
+                + 0.30 * reliability_score
             )
             scores[track_id] = {
                 "total": total,
@@ -331,50 +338,55 @@ class DancerSelector:
             }
         self.scores = scores
 
-        if self.selected_id is not None:
-            if self.selected_id in seen_ids:
-                self._selected_missing_since = None
-            elif self._selected_missing_since is None:
-                self._selected_missing_since = now
-            elif now - self._selected_missing_since >= 1.2:
-                self.selected_id = None
-                self._selected_missing_since = None
+        # Existing dancers leave only after a sustained low score or absence.
+        for track_id in list(self.selected_ids):
+            if track_id not in seen_ids:
+                self._missing_since.setdefault(track_id, now)
+                if now - self._missing_since[track_id] >= 1.2:
+                    self.selected_ids.discard(track_id)
+                    self._missing_since.pop(track_id, None)
+                    self._below_threshold_since.pop(track_id, None)
+                continue
 
-        eligible_scores = {
-            track_id: score
-            for track_id, score in scores.items()
-            if score["eligible"]
-        }
-        if not eligible_scores:
-            self._challenger_id = None
-            self._challenger_since = None
-            return self.selected_id, scores
+            self._missing_since.pop(track_id, None)
+            total = scores.get(track_id, {}).get("total", 0.0)
+            if total < 0.30:
+                self._below_threshold_since.setdefault(track_id, now)
+                if now - self._below_threshold_since[track_id] >= 1.0:
+                    self.selected_ids.discard(track_id)
+                    self._below_threshold_since.pop(track_id, None)
+            else:
+                self._below_threshold_since.pop(track_id, None)
 
-        best_id = max(eligible_scores, key=lambda track_id: eligible_scores[track_id]["total"])
-        best_total = eligible_scores[best_id]["total"]
+        # Every non-selected person qualifies independently; there is no
+        # single "winner", so multiple people can become dancers together.
+        for track_id, score in scores.items():
+            if track_id in self.selected_ids:
+                self._qualifying_since.pop(track_id, None)
+                continue
+            qualifies = (
+                score["eligible"]
+                and score["template"] >= 0.45
+                and score["activity"] >= 0.15
+                and score["total"] >= 0.40
+            )
+            if not qualifies:
+                self._qualifying_since.pop(track_id, None)
+                continue
+            self._qualifying_since.setdefault(track_id, now)
+            if now - self._qualifying_since[track_id] >= 0.7:
+                self.selected_ids.add(track_id)
+                self._qualifying_since.pop(track_id, None)
+                self._missing_since.pop(track_id, None)
 
-        if self.selected_id is None:
-            should_challenge = best_total >= 0.32
-        elif best_id == self.selected_id:
-            self._challenger_id = None
-            self._challenger_since = None
-            return self.selected_id, scores
-        else:
-            current_total = scores.get(self.selected_id, {}).get("total", 0.0)
-            should_challenge = best_total >= current_total + 0.12
+        active_track_ids = set(self.tracks)
+        for timers in (
+            self._qualifying_since,
+            self._below_threshold_since,
+            self._missing_since,
+        ):
+            for track_id in list(timers):
+                if track_id not in active_track_ids and track_id not in self.selected_ids:
+                    timers.pop(track_id, None)
 
-        if not should_challenge:
-            self._challenger_id = None
-            self._challenger_since = None
-            return self.selected_id, scores
-
-        if self._challenger_id != best_id:
-            self._challenger_id = best_id
-            self._challenger_since = now
-        elif self._challenger_since is not None and now - self._challenger_since >= 0.7:
-            self.selected_id = best_id
-            self._selected_missing_since = None
-            self._challenger_id = None
-            self._challenger_since = None
-
-        return self.selected_id, scores
+        return set(self.selected_ids), scores

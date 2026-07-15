@@ -72,7 +72,7 @@ class PoseApp:
         self.template_confidences = None
         self.template_valid = None
         self.dancer_selector = None
-        self.dance_scorer = None
+        self.dance_scorers = {}
         # Time of the template frame that Tkinter has actually displayed.
         self._template_time = None
 
@@ -137,7 +137,7 @@ class PoseApp:
                 self.template_confidences = None
                 self.template_valid = None
                 self.dancer_selector = None
-                self.dance_scorer = None
+                self.dance_scorers = {}
 
             video_path = Path(path)
             automatic_candidates = [
@@ -203,7 +203,6 @@ class PoseApp:
                 raise ValueError("The pose cache contains no valid template poses")
 
             selector = DancerSelector(timestamps, keypoints, confidences, valid)
-            scorer = DanceScorer(timestamps, keypoints, confidences, valid)
             with self._selector_lock:
                 self.template_pose_path = str(path)
                 self.template_timestamps = timestamps
@@ -211,7 +210,7 @@ class PoseApp:
                 self.template_confidences = confidences
                 self.template_valid = valid
                 self.dancer_selector = selector
-                self.dance_scorer = scorer
+                self.dance_scorers = {}
             if show_message:
                 messagebox.showinfo(
                     "Pose Data Loaded",
@@ -246,8 +245,7 @@ class PoseApp:
             self._template_time = None
         with self._selector_lock:
             self.dancer_selector.reset()
-            if self.dance_scorer is not None:
-                self.dance_scorer.reset_session()
+            self.dance_scorers.clear()
         self.running_file = True
         self._file_thread = threading.Thread(target=self._video_worker, daemon=True)
         self._file_thread.start()
@@ -266,8 +264,8 @@ class PoseApp:
             self._latest_file = None
             self._template_time = None
         with self._selector_lock:
-            if self.dance_scorer is not None:
-                self.dance_scorer.pause()
+            for scorer in self.dance_scorers.values():
+                scorer.pause()
 
     def toggle_video_display(self):
         self.show_video_frame = not self.show_video_frame
@@ -308,8 +306,7 @@ class PoseApp:
         if self.dancer_selector is not None:
             with self._selector_lock:
                 self.dancer_selector.reset()
-                if self.dance_scorer is not None:
-                    self.dance_scorer.reset_session()
+                self.dance_scorers.clear()
         predictor = getattr(model, "predictor", None)
         for tracker in getattr(predictor, "trackers", []) if predictor else []:
             reset = getattr(tracker, "reset", None)
@@ -334,8 +331,8 @@ class PoseApp:
             self._latest_cam_status = "No dancer selected"
             self._latest_score_text = "Score: --"
         with self._selector_lock:
-            if self.dance_scorer is not None:
-                self.dance_scorer.pause()
+            for scorer in self.dance_scorers.values():
+                scorer.pause()
         self.label_cam_status.configure(text="No dancer selected")
         self.label_score.configure(text="Score: --")
 
@@ -414,47 +411,58 @@ class PoseApp:
                     )
 
             selector = self.dancer_selector
-            scorer = self.dance_scorer
-            score_result = None
+            score_results = {}
             if selector is not None:
                 with self._selector_lock:
-                    selected_id, scores = selector.update(
+                    selected_ids, scores = selector.update(
                         detections, capture_clock, template_time_at_capture
                     )
                     template_active = selector.template_active
-                    selected_detection = next(
-                        (
-                            detection
-                            for detection in detections
-                            if detection["track_id"] == selected_id
-                        ),
-                        None,
-                    )
-                    if (
-                        scorer is not None
-                        and template_active
-                        and selected_detection is not None
-                    ):
-                        score_result = scorer.update(
-                            selected_id,
-                            selected_detection["keypoints"],
-                            selected_detection["confidence"],
-                            capture_clock,
-                            template_time_at_capture,
-                        )
-                    elif scorer is not None:
-                        scorer.pause()
+                    detections_by_id = {
+                        detection["track_id"]: detection
+                        for detection in detections
+                    }
+                    if template_active:
+                        for track_id in list(self.dance_scorers):
+                            if track_id not in selected_ids:
+                                self.dance_scorers.pop(track_id, None)
+                        for track_id in selected_ids:
+                            detection = detections_by_id.get(track_id)
+                            if detection is None:
+                                continue
+                            scorer = self.dance_scorers.get(track_id)
+                            if scorer is None:
+                                scorer = DanceScorer(
+                                    self.template_timestamps,
+                                    self.template_keypoints,
+                                    self.template_confidences,
+                                    self.template_valid,
+                                )
+                                self.dance_scorers[track_id] = scorer
+                            result = scorer.update(
+                                track_id,
+                                detection["keypoints"],
+                                detection["confidence"],
+                                capture_clock,
+                                template_time_at_capture,
+                            )
+                            if result is not None:
+                                score_results[track_id] = result
+                    else:
+                        for scorer in self.dance_scorers.values():
+                            scorer.pause()
             else:
-                selected_id, scores = None, {}
+                selected_ids, scores = set(), {}
                 template_active = False
 
             processed = frame.copy()
             height, width = processed.shape[:2]
             for detection in detections:
                 track_id = detection["track_id"]
-                is_selected = track_id == selected_id
-                line_color = (0, 255, 0) if is_selected else (150, 150, 150)
-                point_color = (0, 0, 255) if is_selected else (110, 110, 110)
+                is_selected = track_id in selected_ids
+                # OpenCV uses BGR: unselected people use bright cyan/blue.
+                line_color = (0, 255, 0) if is_selected else (255, 220, 0)
+                point_color = (0, 0, 255) if is_selected else (255, 80, 0)
                 self._draw_skeleton(
                     processed,
                     detection["keypoints"],
@@ -467,12 +475,18 @@ class PoseApp:
                 x1, y1, x2, y2 = detection["bbox"]
                 box_start = (int(x1 * width), int(y1 * height))
                 box_end = (int(x2 * width), int(y2 * height))
-                box_color = (0, 255, 0) if is_selected else (160, 160, 160)
+                box_color = (0, 255, 0) if is_selected else (255, 220, 0)
                 cv2.rectangle(processed, box_start, box_end, box_color, 2)
                 total = scores.get(track_id, {}).get("total", 0.0)
                 label = f"ID {track_id}  {total:.2f}"
                 if is_selected:
-                    label = f"DANCER {label}"
+                    current_score = score_results.get(track_id, {}).get("total")
+                    score_suffix = (
+                        f" SCORE {current_score:.0f}"
+                        if current_score is not None
+                        else ""
+                    )
+                    label = f"DANCER {label}{score_suffix}"
                 cv2.putText(
                     processed,
                     label,
@@ -484,10 +498,10 @@ class PoseApp:
                     cv2.LINE_AA,
                 )
 
-            if score_result is not None:
+            if selected_ids:
                 cv2.putText(
                     processed,
-                    f"SCORE {score_result['total']:.0f}",
+                    f"DANCERS {len(selected_ids)}",
                     (20, 35),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.9,
@@ -505,33 +519,38 @@ class PoseApp:
             elif not template_active:
                 status = "Waiting for template dancer..."
                 score_text = "Score paused: no template pose"
-            elif selected_id is None:
-                status = "Searching for dancer..."
-                score_text = "Score: waiting for dancer"
+            elif not selected_ids:
+                status = "Searching for dancers..."
+                score_text = "Score: waiting for dancers"
             else:
-                selected_score = scores.get(selected_id, {})
-                status = (
-                    f"Dancer ID {selected_id} | "
-                    f"template {selected_score.get('template', 0.0):.2f} | "
-                    f"motion {selected_score.get('activity', 0.0):.2f}"
-                )
-                if score_result is None:
-                    score_text = "Calibrating score..."
-                else:
-                    mirror_text = "mirrored" if score_result["mirrored"] else "direct"
+                status_parts = []
+                score_lines = []
+                for track_id in sorted(selected_ids):
+                    selected_score = scores.get(track_id, {})
+                    status_parts.append(
+                        f"ID {track_id} "
+                        f"(template {selected_score.get('template', 0.0):.2f}, "
+                        f"motion {selected_score.get('activity', 0.0):.2f})"
+                    )
+                    score_result = score_results.get(track_id)
+                    if score_result is None:
+                        score_lines.append(f"ID {track_id}: calibrating...")
+                        continue
                     motion_text = (
                         f"{score_result['motion']:.0f}"
                         if score_result["motion_informative"]
                         else "--"
                     )
-                    score_text = (
+                    score_lines.append(
+                        f"ID {track_id}: Current {score_result['total']:.0f} | "
+                        f"Overall {score_result['overall']:.0f} | "
                         f"Pose {score_result['pose']:.0f} | "
                         f"Motion {motion_text} | "
                         f"Timing {score_result['timing']:.0f} | "
-                        f"Delay {score_result['lag']:.2f}s ({mirror_text})\n"
-                        f"Current {score_result['total']:.0f} | "
-                        f"Overall {score_result['overall']:.0f}"
+                        f"Delay {score_result['lag']:.2f}s"
                     )
+                status = "Dancers: " + "; ".join(status_parts)
+                score_text = "\n".join(score_lines)
 
             with self._frame_lock:
                 self._latest_cam = processed
