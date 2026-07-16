@@ -79,3 +79,37 @@ Webcam worker thread ─┘                                  │
 
 This separates expensive pose inference from interface rendering and removes
 the main cause of the flashing behavior.
+
+
+Here is the documented issue and solution written in the same Markdown format and style as your example:
+
+---
+
+## 3. Reference video playback speed distortion
+
+### Problem
+
+The template/reference video did not play at its original, native speed. It either suffered from cumulative slowdowns or general pacing mismatches.
+
+The primary cause was the video worker thread's frame timing implementation. It relied on a sequential relative delay calculation (`started_at + video_time - time.monotonic()`) inside the loop. If certain frames took longer to process or render due to system overhead, the loop accumulated lag over time. Additionally, relying purely on the computed frame index and a generic FPS estimation from OpenCV could lead to playback drift if the video possessed variable frame rates or minor encoding inconsistencies.
+
+### Solution
+
+The video worker's loop was refactored to enforce a strict synchronization mechanism based on the video’s absolute internal clock:
+
+* **Absolute Clock Alignment:** Instead of calculating time by incrementing frame counts, the system queries the exact hardware-level playback timestamp from the video file container using `cv2.CAP_PROP_POS_MSEC`.
+* **Dynamic Waiting:** The worker calculates the real elapsed time since the video started and compares it directly against the video's absolute timestamp. If the processing thread gets ahead of the video, it dynamically sleeps for the precise remainder (`wait_seconds = video_time - elapsed`).
+* **Lag Recovery:** If the thread falls behind due to heavy inference overhead, the negative wait duration is ignored, preventing the loop from queueing up "stale" sleep delays and causing an ongoing slowdown.
+
+The updated pipeline workflow in `danceapp.py` is structured as follows:
+
+```text
+Video Worker Loop ──> Fetch cv2.CAP_PROP_POS_MSEC ──> Compare with elapsed monotonic time
+                                                                   │
+    ┌───────────────── Catch up / Skip Sleep <─────────────────────┤ (If system lags behind video)
+    ▼                                                              ▼
+Draw Template Pose ──> Update thread-safe buffer ──> Sleep precisely for remaining time delta
+
+```
+
+This absolute time alignment ensures that even if individual frames fluctuate in processing demands, the visual pacing of the reference template remains perfectly synchronized with real-world time.
