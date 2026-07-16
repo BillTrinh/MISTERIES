@@ -1,0 +1,33 @@
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# Datasets and generated data
+facial_expression_dataset/
+cache/
+outputs/
+models/
+template_data/
+
+# Model weights and generated artifacts
+*.pt
+*.pth
+*.onnx
+*.joblib
+*.pkl
+*.npz
+
+# Videos
+*.mp4
+
+# IDE
+.vscode/
+.idea/
