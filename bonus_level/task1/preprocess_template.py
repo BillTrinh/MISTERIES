@@ -57,7 +57,12 @@ def parse_args():
         "--track-id",
         type=int,
         default=None,
-        help="Use a specific tracked person instead of automatic selection",
+        help="Use one tracked person for the whole video (legacy mode)",
+    )
+    parser.add_argument(
+        "--single-track",
+        action="store_true",
+        help="Pick one global dancer for the entire video (legacy mode)",
     )
     return parser.parse_args()
 
@@ -99,6 +104,109 @@ def _track_quality(records, sample_count):
         "samples": len(records),
     }
     return quality, summary
+
+
+def _instant_dominance(record):
+    """Score one detection for dominance at a single timestamp."""
+    visibility = float(np.mean(record["confidence"] >= 0.3))
+    x1, y1, x2, y2 = record["bbox"]
+    area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_score = min(1.0, area / 0.25)
+    center_x = (x1 + x2) * 0.5
+    center_y = (y1 + y2) * 0.5
+    distance = np.hypot(center_x - 0.5, center_y - 0.5)
+    center_score = max(0.0, 1.0 - distance / 0.71)
+    return 0.45 * visibility + 0.40 * area_score + 0.15 * center_score
+
+
+def _build_per_sample_index(tracks):
+    """Map each sample index to all track observations at that time."""
+    per_sample = defaultdict(list)
+    for track_id, records in tracks.items():
+        for record in records:
+            per_sample[record["sample_index"]].append((track_id, record))
+    return per_sample
+
+
+def _select_dominant_per_sample(per_sample, sample_count, hysteresis=0.08):
+    """Pick the best dancer at each timestamp with short temporal hysteresis."""
+    selected = []
+    active_track = None
+
+    for sample_index in range(sample_count):
+        candidates = per_sample.get(sample_index, [])
+        if not candidates:
+            selected.append(None)
+            active_track = None
+            continue
+
+        ranked = sorted(
+            candidates,
+            key=lambda item: _instant_dominance(item[1]),
+            reverse=True,
+        )
+        best_track, best_record = ranked[0]
+        best_score = _instant_dominance(best_record)
+
+        if active_track is not None:
+            current = next(
+                (record for track_id, record in candidates if track_id == active_track),
+                None,
+            )
+            if current is not None:
+                current_score = _instant_dominance(current)
+                if current_score + hysteresis >= best_score:
+                    best_track = active_track
+                    best_record = current
+
+        selected.append((best_track, best_record))
+        active_track = best_track
+
+    return selected
+
+
+def _segments_from_selection(timestamps, selected):
+    """Summarise contiguous time ranges that use the same template track."""
+    segments = []
+    current_track = None
+    start_time = None
+
+    for timestamp, item in zip(timestamps, selected):
+        if item is None:
+            if current_track is not None:
+                segments.append(
+                    {
+                        "track_id": int(current_track),
+                        "start_seconds": round(float(start_time), 3),
+                        "end_seconds": round(float(timestamp), 3),
+                    }
+                )
+                current_track = None
+                start_time = None
+            continue
+
+        track_id, _ = item
+        if track_id != current_track:
+            if current_track is not None:
+                segments.append(
+                    {
+                        "track_id": int(current_track),
+                        "start_seconds": round(float(start_time), 3),
+                        "end_seconds": round(float(timestamp), 3),
+                    }
+                )
+            current_track = track_id
+            start_time = timestamp
+
+    if current_track is not None and start_time is not None:
+        segments.append(
+            {
+                "track_id": int(current_track),
+                "start_seconds": round(float(start_time), 3),
+                "end_seconds": round(float(timestamps[-1]), 3),
+            }
+        )
+    return segments
 
 
 def preprocess(args):
@@ -204,30 +312,59 @@ def preprocess(args):
         ranked_tracks.append((quality, track_id))
     ranked_tracks.sort(reverse=True)
 
+    sample_count = len(sample_timestamps)
+    keypoints = np.full((sample_count, 17, 2), np.nan, dtype=np.float32)
+    confidences = np.zeros((sample_count, 17), dtype=np.float32)
+    bboxes = np.full((sample_count, 4), np.nan, dtype=np.float32)
+    valid = np.zeros(sample_count, dtype=bool)
+    selected_track_ids = np.full(sample_count, -1, dtype=np.int32)
+
     if args.track_id is not None:
         if args.track_id not in tracks:
             available = ", ".join(str(track_id) for _, track_id in ranked_tracks)
             raise ValueError(
                 f"Track ID {args.track_id} was not found. Available IDs: {available}"
             )
-        selected_track_id = args.track_id
-        selection_method = "manual"
-    else:
+        selection_method = "manual_single_track"
+        for record in tracks[args.track_id]:
+            index = record["sample_index"]
+            keypoints[index] = record["keypoints"]
+            confidences[index] = record["confidence"]
+            bboxes[index] = record["bbox"]
+            valid[index] = True
+            selected_track_ids[index] = args.track_id
+        segments = _segments_from_selection(
+            sample_timestamps,
+            [(args.track_id, None) if valid[i] else None for i in range(sample_count)],
+        )
+    elif args.single_track:
         selected_track_id = ranked_tracks[0][1]
-        selection_method = "automatic"
-
-    sample_count = len(sample_timestamps)
-    keypoints = np.full((sample_count, 17, 2), np.nan, dtype=np.float32)
-    confidences = np.zeros((sample_count, 17), dtype=np.float32)
-    bboxes = np.full((sample_count, 4), np.nan, dtype=np.float32)
-    valid = np.zeros(sample_count, dtype=bool)
-
-    for record in tracks[selected_track_id]:
-        index = record["sample_index"]
-        keypoints[index] = record["keypoints"]
-        confidences[index] = record["confidence"]
-        bboxes[index] = record["bbox"]
-        valid[index] = True
+        selection_method = "automatic_single_track"
+        for record in tracks[selected_track_id]:
+            index = record["sample_index"]
+            keypoints[index] = record["keypoints"]
+            confidences[index] = record["confidence"]
+            bboxes[index] = record["bbox"]
+            valid[index] = True
+            selected_track_ids[index] = selected_track_id
+        segments = _segments_from_selection(
+            sample_timestamps,
+            [(selected_track_id, None) if valid[i] else None for i in range(sample_count)],
+        )
+    else:
+        selection_method = "per_sample_dominant"
+        per_sample = _build_per_sample_index(tracks)
+        dominant = _select_dominant_per_sample(per_sample, sample_count)
+        segments = _segments_from_selection(sample_timestamps, dominant)
+        for sample_index, item in enumerate(dominant):
+            if item is None:
+                continue
+            track_id, record = item
+            keypoints[sample_index] = record["keypoints"]
+            confidences[sample_index] = record["confidence"]
+            bboxes[sample_index] = record["bbox"]
+            valid[sample_index] = True
+            selected_track_ids[sample_index] = int(track_id)
 
     output_dir = args.output_dir.expanduser().resolve() / video_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -242,10 +379,11 @@ def preprocess(args):
         confidences=confidences,
         bboxes=bboxes,
         valid=valid,
+        selected_track_ids=selected_track_ids,
     )
 
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_video": str(video_path),
         "source_file_size": video_path.stat().st_size,
@@ -259,17 +397,26 @@ def preprocess(args):
         "confidence_threshold": args.conf,
         "sample_fps": sample_fps,
         "sample_count": sample_count,
-        "selected_track_id": selected_track_id,
         "selection_method": selection_method,
         "selected_valid_samples": int(np.sum(valid)),
+        "segment_count": len(segments),
+        "segments": segments,
         "tracks": track_summaries,
     }
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    print(f"Selected template track: {selected_track_id} ({selection_method})")
+    print(f"Selection mode: {selection_method}")
     print(f"Valid poses: {int(np.sum(valid))}/{sample_count}")
+    print(f"Template segments: {len(segments)}")
+    for index, segment in enumerate(segments[:8], start=1):
+        print(
+            f"  Segment {index}: track {segment['track_id']} "
+            f"{segment['start_seconds']:.2f}s -> {segment['end_seconds']:.2f}s"
+        )
+    if len(segments) > 8:
+        print(f"  ... and {len(segments) - 8} more")
     print(f"Pose cache: {poses_path}")
     print(f"Metadata:   {metadata_path}")
 
