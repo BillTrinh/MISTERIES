@@ -86,23 +86,23 @@ class PoseApp:
         self._cam_lost = False
 
         # Set up frames
-        # 让根窗口的权重均分，实现左右对称
+        # Distribute root window column weights evenly for left-right symmetry
         self.root.columnconfigure(0, weight=1)
         self.root.columnconfigure(1, weight=1)
 
-        # 1. 上方视频与摄像头区域
+        # 1. Top video and camera area
         self.left_frame = tk.Frame(self.root)
         self.left_frame.grid(row=0, column=0, padx=20, pady=10, sticky="nsew")
 
         self.right_frame = tk.Frame(self.root)
         self.right_frame.grid(row=0, column=1, padx=20, pady=10, sticky="nsew")
 
-        # 2. 下方独立评分区域 (横跨两列 columnspan=2)
+        # 2. Bottom independent scoring area (spans two columns columnspan=2)
         self.score_frame = tk.Frame(self.root)
         self.score_frame.grid(row=1, column=0, columnspan=2, pady=20, sticky="ew")
-        self.score_frame.columnconfigure(0, weight=1) # 让内部组件居中
+        self.score_frame.columnconfigure(0, weight=1) # Center the internal components
 
-        # --- 左侧组件 (视频及控制) ---
+        # --- Left components (video and controls) ---
         self.label_file = tk.Label(self.left_frame)
         self.label_file.pack()
         self.controls_file = tk.Frame(self.left_frame)
@@ -112,7 +112,7 @@ class PoseApp:
         tk.Button(self.controls_file, text="Start Video", command=self.start_video).pack(side=tk.LEFT, padx=5)
         tk.Button(self.controls_file, text="Stop Video", command=self.stop_video).pack(side=tk.LEFT, padx=5)
 
-        # --- 右侧组件 (摄像头及控制) ---
+        # --- Right components (camera and controls) ---
         self.label_cam = tk.Label(self.right_frame)
         self.label_cam.pack()
         self.controls_cam = tk.Frame(self.right_frame)
@@ -120,7 +120,7 @@ class PoseApp:
         tk.Button(self.controls_cam, text="Start Camera", command=self.start_cam).pack(side=tk.LEFT, padx=5)
         tk.Button(self.controls_cam, text="Stop Camera", command=self.stop_cam).pack(side=tk.LEFT, padx=5)
 
-        # --- 下方中央组件 (将状态和评分放到 score_frame 中，并设置 anchor="center" 居中) ---
+        # --- Bottom center components (place status and score in score_frame, and set anchor="center" to center them) ---
         self.label_cam_status = tk.Label(
             self.score_frame, text="No dancer selected", font=("Arial", 12), anchor="center"
         )
@@ -361,19 +361,19 @@ class PoseApp:
                 self.running_file = False
                 break
 
-            # 计算这一帧原本应该在什么绝对时间点播放
+            # Calculate the absolute time this frame is supposed to be played
             current_time = time.monotonic()
             elapsed = current_time - started_at
             
-            # 读取当前帧在视频中的实际时间戳（毫秒转秒）
+            # Get the actual timestamp of the current frame in the video (convert ms to seconds)
             video_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
             
-            # 如果视频跑得太快了，就等等它
+            # If the video is playing too fast, wait for it
             wait_seconds = video_time - elapsed
             if wait_seconds > 0:
                 time.sleep(wait_seconds)
             
-            # 如果处理太慢导致视频滞后了（wait_seconds < -0.1），可以选择跳帧，这里保持正常渲染
+            # If processing is too slow and the video lags (wait_seconds < -0.1), frame dropping could be used; here we keep normal rendering
             processed = self._draw_template_pose(frame, video_time)
             with self._frame_lock:
                 self._latest_file = (processed, video_time)
@@ -615,7 +615,7 @@ class PoseApp:
         self.root.after(UI_INTERVAL_MS, self._tick_cam_ui)
 
     def _draw_template_pose(self, frame, video_time):
-        # 默认总是显示视频画面，直接复制输入的视频帧
+        # Always display the video frame by default, copy the input video frame directly
         overlay = frame.copy()
 
         selector = self.dancer_selector
