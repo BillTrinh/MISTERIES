@@ -27,8 +27,8 @@ from refine_prompt import ollama_available, refine
 
 ROOT = Path(__file__).resolve().parent.parent
 SIGNS_DIR = ROOT / "data" / "signs"
-MIN_SCORE = 0.88
-HOP_SECONDS = 0.20
+MIN_SCORE = 0.68
+HOP_SECONDS = 0.15
 MIN_FRAMES = 20
 MAX_FRAMES = 900
 
@@ -104,7 +104,7 @@ def draw_ui(frame, recording, n_frames, status, words, user, reply, llm_up):
 
 def main():
     print("Loading FAST+ word templates ...")
-    templates = load_word_templates(SIGNS_DIR, max_templates_per_word=4)
+    templates = load_word_templates(SIGNS_DIR, max_templates_per_word=6)
     print("Words:", ", ".join(sorted(templates)))
 
     tracker = SignTracker()
@@ -180,8 +180,6 @@ def main():
                                 f"{hit['start_seconds']:.2f}s -> {hit['end_seconds']:.2f}s "
                                 f"score={hit['score']:.3f} "
                                 f"(pose={hit.get('pose', 0):.2f} "
-                                f"ang={hit.get('angle', 0):.2f} "
-                                f"coord={hit.get('coordinate', 0):.2f} "
                                 f"motion={hit.get('motion', 0):.2f} "
                                 f"lag={hit.get('lag', 0)})"
                             )

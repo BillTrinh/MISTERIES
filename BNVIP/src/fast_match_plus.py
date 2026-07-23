@@ -1,9 +1,8 @@
-"""Stronger fast similarity matching using dance-style scoring (no DTW).
+"""Stronger fast similarity matching (no DTW).
 
 Compared with fast_match.py (left unchanged):
-  - no whole-sequence cosine
-  - dance-like pose: weighted landmark distance + finger/palm angles
-  - dance-like motion: per-landmark delta direction + magnitude
+  - pose cosine after normalize + resample
+  - motion direction/magnitude similarity (frame deltas)
   - small lag search (±frames) instead of full DTW
   - motion gate, peak picking, same-word merge
 """
@@ -22,263 +21,62 @@ from sequence_utils import (
     resample_sequence,
 )
 
-# Same blend as dance_scorer alignment when motion is informative.
-POSE_WEIGHT = 0.75
-MOTION_WEIGHT = 0.25
-COORD_SIGMA = 0.65
-ANGLE_SIGMA = np.deg2rad(35.0)
-MOTION_FLOOR = 0.025  # same idea as dance_scorer template magnitude gate
-N_LANDMARKS = 42  # 21 per hand × 2
-SCORE_FRAMES = 8  # subsample frames for angle/motion (keeps dance formula, stays fast)
+POSE_WEIGHT = 0.65
+MOTION_WEIGHT = 0.35
+MOTION_FLOOR = 0.018  # template delta magnitude to count as "moving"
 
 
-def _hand_angle_triplets() -> tuple[tuple[int, int, int], ...]:
-    """MediaPipe hand joints for both hands (offsets 0 and 21)."""
-    one_hand = (
-        (1, 2, 3),
-        (2, 3, 4),
-        (5, 6, 7),
-        (6, 7, 8),
-        (9, 10, 11),
-        (10, 11, 12),
-        (13, 14, 15),
-        (14, 15, 16),
-        (17, 18, 19),
-        (18, 19, 20),
-        (0, 5, 9),
-        (0, 9, 13),
-        (0, 13, 17),
-    )
-    triplets = []
-    for offset in (0, 21):
-        for a, b, c in one_hand:
-            triplets.append((a + offset, b + offset, c + offset))
-    return tuple(triplets)
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    b = np.asarray(b, dtype=np.float32).reshape(-1)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom < 1e-8:
+        return 0.0
+    return float(np.clip(np.dot(a, b) / denom, 0.0, 1.0))
 
 
-ANGLE_TRIPLETS = _hand_angle_triplets()
-# Prefer fingertips / distal joints, like dance prefers wrists/ankles.
-_HAND_W = np.asarray(
-    [
-        0.8,  # wrist
-        0.7,
-        1.0,
-        1.1,
-        1.3,  # thumb
-        0.9,
-        1.0,
-        1.1,
-        1.3,  # index
-        0.9,
-        1.0,
-        1.1,
-        1.3,  # middle
-        0.9,
-        1.0,
-        1.1,
-        1.3,  # ring
-        0.9,
-        1.0,
-        1.1,
-        1.3,  # pinky
-    ],
-    dtype=np.float32,
-)
-KEYPOINT_WEIGHTS = np.concatenate([_HAND_W, _HAND_W])
-ANGLE_WEIGHTS = np.tile(
-    np.asarray([1.1, 1.3, 1.1, 1.3, 1.1, 1.3, 1.1, 1.3, 1.1, 1.3, 1.0, 1.0, 1.0], dtype=np.float32),
-    2,
-)
+def motion_similarity(seq_a: np.ndarray, seq_b: np.ndarray) -> float:
+    """Motion score on fixed-length keypoint sequences."""
+    a = np.asarray(seq_a, dtype=np.float32).reshape(-1, SIGN_DIM)
+    b = np.asarray(seq_b, dtype=np.float32).reshape(-1, SIGN_DIM)
+    n = min(len(a), len(b))
+    if n < 3:
+        return 0.0
+    a = a[:n]
+    b = b[:n]
+    da = a[1:] - a[:-1]
+    db = b[1:] - b[:-1]
+    mag_a = np.linalg.norm(da, axis=1)
+    mag_b = np.linalg.norm(db, axis=1)
+    moving = mag_b >= MOTION_FLOOR
+    if int(np.sum(moving)) < 2:
+        return _cosine(da, db)
 
-
-def _to_points(seq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(T, 126) -> points (T, 42, 3), visible (T, 42)."""
-    pts = np.asarray(seq, dtype=np.float32).reshape(-1, N_LANDMARKS, 3)
-    visible = ~np.all(pts == 0, axis=2)
-    return pts, visible
-
-
-def _subsample_indices(n: int, k: int = SCORE_FRAMES) -> np.ndarray:
-    if n <= k:
-        return np.arange(n)
-    return np.linspace(0, n - 1, k).astype(int)
-
-
-def _vectorized_coordinate_score(
-    cand_pts: np.ndarray,
-    cand_vis: np.ndarray,
-    tmpl_pts: np.ndarray,
-    tmpl_vis: np.ndarray,
-) -> tuple[float, float]:
-    """Average dance-style coordinate score over all frames."""
-    common = cand_vis & tmpl_vis  # (T, 42)
-    weights = KEYPOINT_WEIGHTS[None, :] * common
-    weight_sum = weights.sum(axis=1)
-    valid_frames = weight_sum >= (8.0 * float(KEYPOINT_WEIGHTS.mean()))
-    if not np.any(valid_frames):
-        return 0.0, 0.0
-
-    diff = cand_pts - tmpl_pts
-    dist = np.linalg.norm(diff, axis=2)  # (T, 42)
-    dist = np.where(common, dist, 0.0)
-    coordinate_error = np.zeros(len(cand_pts), dtype=np.float32)
-    nonzero = weight_sum > 1e-6
-    coordinate_error[nonzero] = (dist * weights).sum(axis=1)[nonzero] / weight_sum[nonzero]
-    scores = np.exp(-((coordinate_error / COORD_SIGMA) ** 2))
-    scores = scores[valid_frames]
-    coverage = float(
-        np.mean(weight_sum[valid_frames] / np.maximum(KEYPOINT_WEIGHTS.sum() * 0.5, 1e-6))
-    )
-    coverage = float(np.clip(coverage, 0.0, 1.0))
-    return float(np.mean(scores)), coverage
-
-
-def _batch_joint_angles(points: np.ndarray, visible: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """points (T, 42, 3), visible (T, 42) -> angles (T, A), valid (T, A)."""
-    t = points.shape[0]
-    a_count = len(ANGLE_TRIPLETS)
-    angles = np.zeros((t, a_count), dtype=np.float32)
-    valid = np.zeros((t, a_count), dtype=bool)
-    for i, (pa, pv, pc) in enumerate(ANGLE_TRIPLETS):
-        ok = visible[:, pa] & visible[:, pv] & visible[:, pc]
-        if not np.any(ok):
-            continue
-        va = points[:, pa] - points[:, pv]
-        vc = points[:, pc] - points[:, pv]
-        denom = np.linalg.norm(va, axis=1) * np.linalg.norm(vc, axis=1)
-        good = ok & (denom > 1e-6)
-        if not np.any(good):
-            continue
-        cos = np.sum(va[good] * vc[good], axis=1) / denom[good]
-        cos = np.clip(cos, -1.0, 1.0)
-        angles[good, i] = np.arccos(cos)
-        valid[good, i] = True
-    return angles, valid
-
-
-def _angle_score_over_frames(
-    cand_pts: np.ndarray,
-    cand_vis: np.ndarray,
-    tmpl_pts: np.ndarray,
-    tmpl_vis: np.ndarray,
-) -> float:
-    cand_ang, cand_ok = _batch_joint_angles(cand_pts, cand_vis)
-    tmpl_ang, tmpl_ok = _batch_joint_angles(tmpl_pts, tmpl_vis)
-    common = cand_ok & tmpl_ok
-    if not np.any(common):
-        return -1.0
-    diffs = np.abs(cand_ang - tmpl_ang)
-    per = np.exp(-((diffs / ANGLE_SIGMA) ** 2))
-    # Weighted average over all valid angle observations.
-    w = ANGLE_WEIGHTS[None, :] * common
-    denom = float(np.sum(w))
-    if denom < 1e-6:
-        return -1.0
-    return float(np.sum(per * w) / denom)
-
-
-def _motion_score_sequence(
-    cand_pts: np.ndarray,
-    cand_vis: np.ndarray,
-    tmpl_pts: np.ndarray,
-    tmpl_vis: np.ndarray,
-) -> float | None:
-    """Dance-like motion over consecutive subsampled frames."""
-    if len(cand_pts) < 2:
-        return None
-    scores = []
-    for i in range(len(cand_pts) - 1):
-        common = cand_vis[i] & cand_vis[i + 1] & tmpl_vis[i] & tmpl_vis[i + 1]
-        if int(np.sum(common)) < 4:
-            continue
-        c_delta = cand_pts[i + 1, common] - cand_pts[i, common]
-        t_delta = tmpl_pts[i + 1, common] - tmpl_pts[i, common]
-        c_mag = np.linalg.norm(c_delta, axis=1)
-        t_mag = np.linalg.norm(t_delta, axis=1)
-        moving = t_mag >= MOTION_FLOOR
-        if int(np.sum(moving)) < 2:
-            continue
-        c_delta = c_delta[moving]
-        t_delta = t_delta[moving]
-        c_mag = c_mag[moving]
-        t_mag = t_mag[moving]
-        denom = np.maximum(c_mag * t_mag, 1e-6)
-        direction = (np.clip(np.sum(c_delta * t_delta, axis=1) / denom, -1.0, 1.0) + 1.0) * 0.5
-        magnitude = np.minimum(c_mag, t_mag) / np.maximum(c_mag, t_mag)
-        scores.append(float(np.mean(0.70 * direction + 0.30 * magnitude)))
-    if not scores:
-        return None
-    return float(np.mean(scores))
+    da = da[moving]
+    db = db[moving]
+    mag_a = mag_a[moving]
+    mag_b = mag_b[moving]
+    denom = np.maximum(mag_a * mag_b, 1e-6)
+    direction = (np.clip(np.sum(da * db, axis=1) / denom, -1.0, 1.0) + 1.0) * 0.5
+    magnitude = np.minimum(mag_a, mag_b) / np.maximum(mag_a, mag_b)
+    return float(np.mean(0.70 * direction + 0.30 * magnitude))
 
 
 def combined_similarity(window_fixed: np.ndarray, template_fixed: np.ndarray) -> dict:
-    """Dance-style pose + motion over a fixed-length window vs template."""
-    cand_pts, cand_vis = _to_points(window_fixed)
-    tmpl_pts, tmpl_vis = _to_points(template_fixed)
-    n = min(len(cand_pts), len(tmpl_pts))
-    if n < 2:
-        return {"score": 0.0, "pose": 0.0, "motion": 0.0, "angle": 0.0, "coordinate": 0.0}
-
-    cand_pts = cand_pts[:n]
-    cand_vis = cand_vis[:n]
-    tmpl_pts = tmpl_pts[:n]
-    tmpl_vis = tmpl_vis[:n]
-
-    coordinate_score, _coverage = _vectorized_coordinate_score(
-        cand_pts, cand_vis, tmpl_pts, tmpl_vis
-    )
-    if coordinate_score <= 0:
-        return {"score": 0.0, "pose": 0.0, "motion": 0.0, "angle": 0.0, "coordinate": 0.0}
-
-    idx = _subsample_indices(n, SCORE_FRAMES)
-    angle_score = _angle_score_over_frames(
-        cand_pts[idx], cand_vis[idx], tmpl_pts[idx], tmpl_vis[idx]
-    )
-    motion_score = _motion_score_sequence(
-        cand_pts[idx], cand_vis[idx], tmpl_pts[idx], tmpl_vis[idx]
-    )
-
-    # Require dance-like evidence: valid finger angles AND motion pairs.
-    if angle_score < 0 or motion_score is None:
-        return {
-            "score": 0.0,
-            "pose": 0.0,
-            "motion": 0.0,
-            "angle": 0.0,
-            "coordinate": float(coordinate_score),
-        }
-
-    pose_score = 0.60 * angle_score + 0.40 * coordinate_score
-    score = POSE_WEIGHT * pose_score + MOTION_WEIGHT * motion_score
-
+    """Pose cosine + motion blend, both sequences already (T, 126)."""
+    pose = _cosine(window_fixed, template_fixed)
+    motion = motion_similarity(window_fixed, template_fixed)
+    score = POSE_WEIGHT * pose + MOTION_WEIGHT * motion
     return {
         "score": float(score),
-        "pose": float(pose_score),
-        "motion": float(motion_score),
-        "angle": float(angle_score),
-        "coordinate": float(coordinate_score),
+        "pose": float(pose),
+        "motion": float(motion),
     }
-
-
-def coordinate_similarity(window_fixed: np.ndarray, template_fixed: np.ndarray) -> float:
-    """Fast dance-style coordinate-only score (coarse filter)."""
-    cand_pts, cand_vis = _to_points(window_fixed)
-    tmpl_pts, tmpl_vis = _to_points(template_fixed)
-    n = min(len(cand_pts), len(tmpl_pts))
-    if n < 2:
-        return 0.0
-    score, _ = _vectorized_coordinate_score(
-        cand_pts[:n], cand_vis[:n], tmpl_pts[:n], tmpl_vis[:n]
-    )
-    return float(score)
-
-
-# --- template loading / scanning ------------------------------------------------
 
 
 def load_word_templates(
     signs_dir: Path,
-    max_templates_per_word: int = 4,
+    max_templates_per_word: int = 6,
 ) -> dict[str, list[np.ndarray]]:
     """Load and cache preprocessed fixed-length templates from *.pkl."""
     signs_dir = Path(signs_dir)
@@ -308,55 +106,25 @@ def _window_motion(window: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(w[1:] - w[:-1], axis=1)))
 
 
-def _prepare_window(
-    window_or_fixed: np.ndarray,
-    *,
-    already_fixed: bool = False,
-    stream_already_normalized: bool = False,
-) -> np.ndarray:
-    if already_fixed:
-        return window_or_fixed
-    if stream_already_normalized:
-        return resample_sequence(window_or_fixed, T_FIXED)
-    return preprocess(window_or_fixed, T_FIXED)
-
-
 def _best_template_score(
     window_or_fixed: np.ndarray,
     templates_fixed: list[np.ndarray],
     *,
     already_fixed: bool = False,
     stream_already_normalized: bool = False,
-    coarse_gate: float = 0.58,
 ) -> dict:
-    """Coarse coordinate filter, then full dance score on the best template(s)."""
-    window_fixed = _prepare_window(
-        window_or_fixed,
-        already_fixed=already_fixed,
-        stream_already_normalized=stream_already_normalized,
-    )
-    if not templates_fixed:
-        return {"score": 0.0, "pose": 0.0, "motion": 0.0, "angle": 0.0, "coordinate": 0.0}
-
-    ranked = []
+    if already_fixed:
+        window_fixed = window_or_fixed
+    elif stream_already_normalized:
+        window_fixed = resample_sequence(window_or_fixed, T_FIXED)
+    else:
+        window_fixed = preprocess(window_or_fixed, T_FIXED)
+    best = {"score": -1.0, "pose": 0.0, "motion": 0.0}
     for tmpl in templates_fixed:
-        coord = coordinate_similarity(window_fixed, tmpl)
-        ranked.append((coord, tmpl))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    if ranked[0][0] < coarse_gate:
-        # Reject without full scoring; do not promote coarse coord to final score.
-        return {
-            "score": 0.0,
-            "pose": 0.0,
-            "motion": 0.0,
-            "angle": 0.0,
-            "coordinate": float(ranked[0][0]),
-        }
-
-    # Full dance score only on the best coarse template.
-    comps = combined_similarity(window_fixed, ranked[0][1])
-    comps["coordinate"] = max(comps.get("coordinate", 0.0), float(ranked[0][0]))
-    return comps
+        comps = combined_similarity(window_fixed, tmpl)
+        if comps["score"] > best["score"]:
+            best = comps
+    return best
 
 
 def _hit_dict(s: int, e: int, fps: float, comps: dict, scale: float, lag: int) -> dict:
@@ -369,8 +137,6 @@ def _hit_dict(s: int, e: int, fps: float, comps: dict, scale: float, lag: int) -
         "score": comps["score"],
         "pose": comps["pose"],
         "motion": comps["motion"],
-        "angle": comps.get("angle", 0.0),
-        "coordinate": comps.get("coordinate", 0.0),
         "scale": float(scale),
         "lag": int(lag),
     }
@@ -381,13 +147,13 @@ def scan_stream_for_word(
     templates_fixed: list[np.ndarray],
     fps: float,
     base_len: int = 40,
-    scales: tuple[float, ...] = (0.85, 1.0, 1.2),
-    hop_seconds: float = 0.20,
-    min_similarity: float = 0.88,
-    lag_frames: int = 1,
+    scales: tuple[float, ...] = (0.80, 1.0, 1.25),
+    hop_seconds: float = 0.15,
+    min_similarity: float = 0.68,
+    lag_frames: int = 2,
     min_motion: float = 0.010,
 ) -> list[dict]:
-    """Slide multi-scale windows; dance-score with small lag search.
+    """Slide multi-scale windows; score with pose+motion and small lag search.
 
     Two-stage for speed: lag=0 first, then refine only promising windows.
     """
@@ -396,8 +162,8 @@ def scan_stream_for_word(
         return []
 
     hop = max(1, int(round(hop_seconds * fps)))
-    refine_gate = min_similarity - 0.08
-    keep_gate = min_similarity - 0.05
+    refine_gate = min_similarity - 0.10
+    keep_gate = min_similarity - 0.06
     best_by_center: dict[int, dict] = {}
 
     for scale in scales:
@@ -436,6 +202,7 @@ def scan_stream_for_word(
             if prev is None or best_local["score"] > prev["score"]:
                 best_by_center[key] = best_local
     return list(best_by_center.values())
+
 
 def _pick_peaks_per_word(
     timeline: list[dict],
@@ -511,8 +278,6 @@ def _merge_same_word(detections: list[dict]) -> list[dict]:
                     "score",
                     "pose",
                     "motion",
-                    "angle",
-                    "coordinate",
                     "scale",
                     "lag",
                     "start_frame",
@@ -537,12 +302,12 @@ def recognize_stream(
     stream: np.ndarray,
     word_templates: dict[str, list[np.ndarray]],
     fps: float = 30.0,
-    min_similarity: float = 0.88,
-    hop_seconds: float = 0.20,
+    min_similarity: float = 0.68,
+    hop_seconds: float = 0.15,
     base_len: int = 40,
-    lag_frames: int = 1,
+    lag_frames: int = 2,
 ) -> dict:
-    """Detect multiple words with dance-style similarity and lag search."""
+    """Detect multiple words with pose+motion similarity and lag search."""
     stream = normalize_sequence(np.asarray(stream, dtype=np.float32))
     timeline: list[dict] = []
     for label, templates in word_templates.items():
