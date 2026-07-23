@@ -71,7 +71,18 @@ $PY src/app.py
 | `src/app_dynamic.py` | Real-time sign -> conversation loop + UI |
 | `src/collect_data.py`, `train_classifier.py`, `classifier.py`, `text_buffer.py`, `app.py` | Static fingerspelling track |
 
-## Continuous multi-sign video (DTW)
+## Continuous multi-sign from webcam (DTW)
+
+Record a longer signing segment live, then detect multiple words inside it:
+
+```bash
+$PY src/app_dtw_continuous.py
+```
+
+Controls: `space` start/stop recording, `r` send unique words to LLM, `c` clear,
+`n` new conversation, `q` quit.
+
+## Continuous multi-sign video file (DTW)
 
 Recognize **several words from one video** without pressing space per word.
 Uses template DTW matching over the full clip (handles different signing
