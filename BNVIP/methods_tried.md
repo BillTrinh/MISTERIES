@@ -38,6 +38,20 @@ Shared data: `data/signs/*.pkl` (~40–50 clips per word, 8 words). Shared hand 
 
 ---
 
+## 2c. FastDTW (continuous)
+
+| | |
+|---|---|
+| **Entry** | `python src/app_fastdtw_continuous.py` |
+| **Core** | `fastdtw_match.py` |
+| **Idea** | Multiresolution approximate DTW: coarsen → recurse → project path → refine near corridor |
+| **Similarity?** | Yes — FastDTW L2 distance → `exp(-dist / 0.20)` |
+| **Uses `.pkl` at inference?** | Yes |
+| **Pros** | Same sliding-window multi-sign pipeline; often cheaper than full-path DTW on longer sequences |
+| **Cons** | Approximate; on short ~40-frame clips may not beat band-limited DTW much |
+
+---
+
 ## 3. Fast resample + cosine (continuous)
 
 | | |
@@ -112,7 +126,9 @@ Shared data: `data/signs/*.pkl` (~40–50 clips per word, 8 words). Shared hand 
 | Method | Continuous? | Template / model | Speed (rough) | Notes |
 |--------|-------------|------------------|---------------|--------|
 | Isolated GRU | No | `sign_gru.pt` | Fast | One word per space |
-| DTW | Yes | `.pkl` | Slow | Best nonlinear alignment |
+| DTW (L2 band) | Yes | `.pkl` | Slow | Nonlinear alignment |
+| DTW (cosine) | Yes | `.pkl` | Slow | Same as DTW, cosine frame cost |
+| FastDTW | Yes | `.pkl` | Slow* | Approx DTW; *often slower than band DTW on short clips |
 | Fast cosine | Yes | `.pkl` | Fast | Linear time warp via resample |
 | GRU windows | Yes | `sign_gru.pt` | Fastest | Duplicate-prone |
 | GRU stable | Yes | `sign_gru.pt` | Fast | Cleaner GRU decode |
