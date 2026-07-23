@@ -17,22 +17,14 @@ __pycache__/
 # Operating system
 .DS_Store
 
-# Keep data/signs, ignore other data
+# Ignore all data except data/signs
 data/*
 !data/signs/
 !data/signs/**
 
-# Keep models folder
+# Allow models folder and all files inside
 !models/
 !models/**
-
-# Ignore large model/checkpoint formats
-*.pt
-*.pth
-*.h5
-*.keras
-*.pkl
-*.joblib
 
 # Logs
 *.log
