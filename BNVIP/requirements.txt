@@ -1,0 +1,6 @@
+# Python 3.11 required (mediapipe has no working 3.14 wheel).
+# cv2 is provided by mediapipe's opencv-contrib-python dependency.
+mediapipe==0.10.14
+numpy
+scikit-learn
+torch
