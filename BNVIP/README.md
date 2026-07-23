@@ -71,10 +71,31 @@ $PY src/app.py
 | `src/app_dynamic.py` | Real-time sign -> conversation loop + UI |
 | `src/collect_data.py`, `train_classifier.py`, `classifier.py`, `text_buffer.py`, `app.py` | Static fingerspelling track |
 
+## Continuous multi-sign video (DTW)
+
+Recognize **several words from one video** without pressing space per word.
+Uses template DTW matching over the full clip (handles different signing
+speeds). Word order is optional; pass `--llm` to let Ollama rewrite the bag
+of words into a sentence.
+
+```bash
+$PY src/recognize_video_dtw.py /path/to/clip.mp4
+$PY src/recognize_video_dtw.py /path/to/clip.mp4 --llm
+$PY src/recognize_video_dtw.py /path/to/clip.mp4 --min-score 0.52
+```
+
+Key files:
+
+| File | Role |
+|------|------|
+| `src/dtw_match.py` | DTW similarity, template load, non-overlapping multi-word pick |
+| `src/recognize_video_dtw.py` | Video → landmarks → multi-word DTW scan (+ optional LLM) |
+
 ## Roadmap
 
 - [x] Static fingerspelling MVP
 - [x] Dynamic word-sign pipeline (GRU) + LLM conversation
+- [x] Continuous multi-sign recognition from one video (DTW)
 - [ ] Collect data + train on chosen vocab
 - [ ] Auto sign segmentation (motion-gated, no key press)
 - [ ] Whisper speech -> caption (reverse direction)
